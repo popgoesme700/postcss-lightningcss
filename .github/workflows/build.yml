@@ -1,19 +1,29 @@
 name: Node CI
 
 on:
-    push:
-    pull_request:
+  push:
+    branches: [ main ]
+  pull_request_target:
+    branches: [ main ]
+
+# give zero permissions to all jobs by default
+permissions: {}
 
 jobs:
 
   # Run linting only once
   lint: 
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        persist-credentials: false
     - name: Use Node.js
-      uses: actions/setup-node@v5.0.0
+      uses: actions/setup-node@v6
       with:
         node-version: 22.x
         cache: 'yarn'
@@ -22,11 +32,12 @@ jobs:
     - name: Lint
       run: yarn lint
 
+  # ─── Job 1: runs PR code, NO secrets, NO write permissions ───────────────
   build:
     strategy:
       matrix:
         os: [ubuntu-latest]
-        node-version: [18.x, 20.x]
+        node-version: [20.x, 22.x, 24.x]
         include:
         - os: macos-latest
           node-version: 20.x
@@ -35,15 +46,65 @@ jobs:
         #  node-version: 20.x
           
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
 
     steps:
-    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        persist-credentials: false
     - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v5.0.0
+      uses: actions/setup-node@v6
       with:
         node-version: ${{ matrix.node-version }}
         cache: 'yarn'
+        package-manager-cache: false
     - name: Yarn install
       run: yarn install
     - name: Test
-      run: yarn test
+      run: yarn test:ci
+    - uses: actions/upload-artifact@v7
+      if: matrix.node-version == '20.x'
+      with:
+        name: reports-${{ matrix.os }}-${{ matrix.node-version }}
+        retention-days: 1
+        path: |
+          **/coverage/lcov.info
+          **/coverage/sonar-report.xml
+          !node_modules/**
+
+  # ─── Job 2: uploads coverage using secrets, does NOT run PR code ─────────
+  static_analysis:
+    name: "🔬 Static Analysis"
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    permissions:
+      contents: read
+    steps:
+    # Commit is needed to check coverage files against content
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+        # Disabling shallow clone is needed by SonarQube
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: reports-*
+        path: __reports
+    - run: find __reports -type f
+    - name: Collect Sonar report paths
+      id: sonar_reports
+      run: |
+        echo "test_reports=$(find __reports -name "sonar-report.xml" | tr '\n' ',' | sed 's/,$//')" >> $GITHUB_OUTPUT
+        echo "project_version=$(git tag -l --sort=-creatordate --format='%(refname:short)' | head -n1)" >> $GITHUB_OUTPUT
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarqube-scan-action@v7
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        args: >
+          -Dsonar.testExecutionReportPaths=${{ steps.sonar_reports.outputs.test_reports }}
+          -Dsonar.projectVersion=`${{ steps.sonar_reports.outputs.project_version  }}`
